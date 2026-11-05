@@ -1,0 +1,15 @@
+# 依赖与第三方运行时库（他方版权，不纳入本仓库）
+js/vendor/
+node_modules/
+
+# 构建/部署产物与本地打包文件
+*.zip
+.genie
+.wbapp_*.genie
+
+# 工具与本地环境数据
+.workbuddy/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,62 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>运维知识库智能问答系统</title>
+  <link rel="stylesheet" href="css/style.css?v=20261028j" />
+  <script src="js/vendor/xlsx.full.min.js?v=20261028j"></script>
+  <script src="js/vendor/workbuddy-cloud-sdk.global.js?v=20261028j"></script>
+  <script src="js/config.js?v=20261028j"></script>
+  <script src="js/cloud.js?v=20261028j"></script>
+  <script src="js/similarity.js?v=20261028j"></script>
+  <script src="js/api.js?v=20261028j"></script>
+  <script src="js/llm.js?v=20261028j"></script>
+  <script src="js/app.js?v=20261028j" defer></script>
+</head>
+<body>
+  <!-- 登录视图（默认可见：即使脚本加载失败也不会白屏） -->
+  <div id="login-view" class="login-wrap">
+    <div class="login-card">
+      <div class="login-logo">
+        <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>
+          <path d="M8 9h8M8 12.5h5"/>
+          <circle cx="8.2" cy="16.5" r="1"/>
+          <circle cx="12" cy="16.5" r="1"/>
+        </svg>
+      </div>
+      <h1>运维知识库智能问答系统</h1>
+      <p class="login-sub">沉淀每一次排障经验，让知识可检索、可复用</p>
+      <button id="btn-workbuddy-login" class="btn btn-primary btn-block" type="button">使用 WorkBuddy 登录</button>
+      <p id="login-error" class="login-error hidden"></p>
+      <p class="login-note">登录后按角色进入：使用人员可问答/查库/上报；管理运维人员可审核、编辑与维护知识库。</p>
+    </div>
+  </div>
+
+  <!-- 主应用 -->
+  <div id="app-view" class="app hidden">
+    <aside class="sidebar">
+      <div class="brand">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>
+          <path d="M8 9h8M8 12.5h5"/>
+        </svg>
+        <span>运维知识库</span>
+      </div>
+      <nav id="nav" class="nav"></nav>
+      <div class="sidebar-foot">
+        <div id="user-chip" class="user-chip"></div>
+        <button id="btn-logout" class="btn btn-ghost btn-block" type="button">退出登录</button>
+      </div>
+    </aside>
+    <main id="view" class="main"></main>
+  </div>
+
+  <!-- 弹层 -->
+  <div id="modal-mask" class="modal-mask hidden">
+    <div id="modal" class="modal"></div>
+  </div>
+  <div id="toast" class="toast hidden"></div>
+</body>
+</html>
