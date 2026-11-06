@@ -187,6 +187,9 @@ label { display: block; font-size: 13px; color: var(--text-2); margin: 12px 0 5p
 .tag-草稿, .tag-已归档 { background: var(--gray-weak); color: var(--text-2); }
 .tag-cat { background: var(--primary-weak); color: var(--primary); }
 .tag-plain { background: var(--gray-weak); color: var(--text-2); }
+/* 类型标签：常识知识蓝 / 产品漏洞红 */
+.tag-kind-know { background: var(--info-weak); color: var(--info); }
+.tag-vuln { background: var(--danger-weak); color: var(--danger); }
 /* 报错码标签：等宽字体，便于与普通标签区分 */
 .tag-code {
   background: var(--gray-weak);
@@ -308,7 +311,7 @@ table.tbl tr:hover td { background: #fafbfd; }
 
 .kb-table-card { padding: 0; overflow: hidden; }
 .table-wrap { max-height: 66vh; overflow: auto; }
-table.kb-tbl { min-width: 860px; }
+table.kb-tbl { min-width: 1150px; }
 table.kb-tbl thead th {
   position: sticky;
   top: 0;
@@ -321,6 +324,7 @@ table.kb-tbl tr:last-child td { border-bottom: none; }
 .col-check input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; accent-color: var(--primary); }
 .col-num { width: 60px; text-align: right !important; color: var(--text-2); }
 .col-time { width: 132px; white-space: nowrap; color: var(--text-2); }
+.col-product { min-width: 110px; }
 .col-act { width: 1%; white-space: nowrap; }
 .col-title { min-width: 260px; }
 table.kb-tbl tr.row-sel td { background: var(--primary-weak); }

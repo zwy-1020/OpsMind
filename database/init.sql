@@ -43,7 +43,7 @@ CREATE TABLE knowledge_items (
   audit_opinion TEXT,
   cite_count INTEGER NOT NULL DEFAULT 0,
   creator TEXT,
-  kind TEXT NOT NULL DEFAULT '故障案例' CHECK (kind IN ('故障案例','常识知识')),
+  kind TEXT NOT NULL DEFAULT '故障案例' CHECK (kind IN ('故障案例','常识知识','产品漏洞')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -158,6 +158,6 @@ GRANT EXECUTE ON FUNCTION register_profile(TEXT), increment_cite(BIGINT), is_adm
 -- ---------- 8. 表注释（可选，便于管理界面识别） ----------
 
 COMMENT ON TABLE profiles IS '用户与角色（RBAC）：admin=管理运维人员 / user=使用人员';
-COMMENT ON TABLE knowledge_items IS '知识条目主表：故障案例 + 常识知识';
+COMMENT ON TABLE knowledge_items IS '知识条目主表：故障案例 + 常识知识 + 产品漏洞';
 COMMENT ON TABLE audit_logs IS '审核记录（通过/驳回/修改）';
 COMMENT ON TABLE operation_logs IS '操作审计日志与大模型 Token 用量记录';

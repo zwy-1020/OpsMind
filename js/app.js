@@ -11,7 +11,7 @@ const state = {
 
 const CATEGORIES = ['数据库', '网络', '系统', '应用', '中间件', '其他'];
 const STATUSES = ['草稿', '待审核', '已通过', '已驳回', '已发布', '已归档'];
-const KINDS = ['故障案例', '常识知识'];
+const KINDS = ['故障案例', '常识知识', '产品漏洞'];
 
 // 入库前本地脱敏（批量导入用；单条录入/上报走大模型脱敏）
 // IPv4 保留首段，账号/密码/密钥/Token 值替换为 ***
@@ -39,6 +39,12 @@ function fmtDate(d) {
 }
 function statusTag(s) { return `<span class="tag tag-${esc(s)}">${esc(s)}</span>`; }
 function catTag(c) { return `<span class="tag tag-cat">${esc(c || '其他')}</span>`; }
+// 类型标签：故障案例灰 / 常识知识蓝 / 产品漏洞红
+function kindTag(k) {
+  if (k === '常识知识') return '<span class="tag tag-kind-know">常识知识</span>';
+  if (k === '产品漏洞') return '<span class="tag tag-vuln">产品漏洞</span>';
+  return '<span class="tag tag-plain">故障案例</span>';
+}
 function plainTag(t) { return `<span class="tag tag-plain">${esc(t)}</span>`; }
 function reportNo(id) {
   const d = new Date();
@@ -351,7 +357,7 @@ function renderAskResult(box, question, hits, meta) {
           <b>${esc(it.title)}</b>
           ${badge}
         </div>
-        <div class="kb-meta">${isKnowledge ? plainTag('常识知识') : ''}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
+        <div class="kb-meta">${kindTag(it.kind)}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
         ${bodyHtml}
         <div class="match-source">来源：运维知识库/${esc(it.product || '未分类')}/${fmtDate(it.updated_at).slice(0, 7)} · 适用环境：${esc(it.environment || '通用')} · 更新时间：${fmtDate(it.updated_at)} · 被引用 ${it.cite_count || 0} 次</div>
       </div>`;
@@ -363,7 +369,7 @@ const KB_PAGE_SIZES = [50, 100, 200];
 
 async function renderKb(view) {
   const isAdmin = state.role === 'admin';
-  const COLSPAN = isAdmin ? 7 : 6;
+  const COLSPAN = isAdmin ? 10 : 9;
   let page = 1;
   let pageSize = Number(localStorage.getItem('kb_page_size')) || 100;
   if (!KB_PAGE_SIZES.includes(pageSize)) pageSize = 100;
@@ -408,6 +414,9 @@ async function renderKb(view) {
           <thead><tr>
             ${isAdmin ? `<th class="col-check"><input type="checkbox" id="kb-check-all" title="全选当前页" /></th>` : ''}
             <th>标题</th>
+            <th>类型</th>
+            <th>分类</th>
+            <th>产品名称</th>
             <th>报错码</th>
             <th>状态</th>
             <th class="col-num">引用</th>
@@ -455,14 +464,16 @@ async function renderKb(view) {
       return;
     }
     tbody.innerHTML = rows.map((it) => {
-      const isK = it.kind === '常识知识';
       const checked = selected.has(it.id);
       return `<tr class="${checked ? 'row-sel' : ''}" data-id="${it.id}">
         ${isAdmin ? `<td class="col-check"><input type="checkbox" class="kb-check" data-id="${it.id}" data-title="${esc(it.title)}" ${checked ? 'checked' : ''} /></td>` : ''}
         <td class="col-title">
           <div class="kb-title" data-id="${it.id}">${esc(it.title)}</div>
-          <div class="kb-meta">${isK ? plainTag('常识知识') : ''}${catTag(it.category)}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}${(it.tags || []).slice(0, 3).map(plainTag).join('')}</div>
+          <div class="kb-meta">${(it.tags || []).slice(0, 4).map(plainTag).join('')}</div>
         </td>
+        <td>${kindTag(it.kind)}</td>
+        <td>${catTag(it.category)}</td>
+        <td class="col-product">${it.product ? esc(it.product) : '<span class="muted">-</span>'}${it.module ? `<div class="kb-sub">${esc(it.module)}</div>` : ''}</td>
         <td>${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : '<span class="muted">-</span>'}</td>
         <td>${statusTag(it.status)}</td>
         <td class="col-num">${it.cite_count || 0}</td>
@@ -906,7 +917,8 @@ function downloadTemplate() {
     TPL_HEADERS,
     ['产品A 启动失败 - connection refused', '故障案例', '产品A 服务启动时报错 connection refused，无法连接依赖的数据库端口，服务反复重启。', '① 检查目标端口是否监听；② 查看服务日志确认依赖是否就绪；③ 重启服务。', '', '产品A', '服务启动', '网络', '生产环境 / Linux', 'v2.x', 'connection refused,端口,启动失败'],
     ['MySQL 1045：Access denied for user 登录被拒', '故障案例', '连接 MySQL 报 ERROR 1045 (28000) Access denied for user，密码确认无误仍无法登录。', '① 查看 mysql.user 中账号对应 host 是否包含来源 IP；② 重置密码；③ 确认认证插件 caching_sha2_password 与客户端驱动兼容。', '1045', 'MySQL', '连接与权限', '数据库', '生产环境', 'MySQL 5.7/8.0', '1045,登录失败,权限'],
-    ['什么是 inode', '常识知识', 'inode 是 Linux 文件系统的索引节点，存储文件的元数据（权限、大小、时间戳、数据块位置）。每个文件占用一个 inode，inode 耗尽后即使磁盘有空间也无法创建新文件，可用 df -i 查看。', '', '', 'Linux', '文件系统', '系统', '通用', '', 'inode,linux,文件系统']
+    ['什么是 inode', '常识知识', 'inode 是 Linux 文件系统的索引节点，存储文件的元数据（权限、大小、时间戳、数据块位置）。每个文件占用一个 inode，inode 耗尽后即使磁盘有空间也无法创建新文件，可用 df -i 查看。', '', '', 'Linux', '文件系统', '系统', '通用', '', 'inode,linux,文件系统'],
+    ['OpenSSL 心跳出血漏洞（CVE-2014-0160）需升级', '产品漏洞', 'OpenSSL 1.0.1 - 1.0.1f 存在 TLS 心跳越界读取漏洞（CVE-2014-0160），可导致服务器内存中的私钥与会话数据泄露。', '① 升级到 OpenSSL 1.0.1g 及以上；② 重启依赖 OpenSSL 的服务（nginx/httpd 等）；③ 更换受影响的证书与密钥。', 'CVE-2014-0160', 'OpenSSL', 'TLS 组件', '系统', '生产环境 / Linux', 'OpenSSL 1.0.1x', 'CVE,漏洞,OpenSSL,升级']
   ];
   const ws = XLSX.utils.aoa_to_sheet(rows);
   ws['!cols'] = TPL_HEADERS.map((h, i) => ({ wch: [38, 10, 50, 50, 14, 12, 12, 10, 16, 10, 22][i] }));
@@ -916,7 +928,7 @@ function downloadTemplate() {
   const help = XLSX.utils.aoa_to_sheet([
     ['填写说明'],
     ['1. 带 * 为必填列：标题、知识内容/问题描述。类型为"故障案例"时解决方案必填。'],
-    ['2. 类型只允许填：故障案例 / 常识知识（常识知识=基本概念、原理、最佳实践，可不填解决方案）。'],
+    ['2. 类型只允许填：故障案例 / 常识知识 / 产品漏洞（常识知识=基本概念、原理、最佳实践，可不填解决方案；产品漏洞=漏洞情报，需填写修复/缓解方案）。'],
     ['3. 故障分类只允许填：数据库 / 网络 / 系统 / 应用 / 中间件 / 其他，其他值将归为"其他"。'],
     ['4. 报错码列用于精确命中：一行可填多个码，用逗号分隔（如 ORA-12541,ORA-12170 / 1045 / 28P01）。用户提问含该码时直接命中本条，无需大模型语义匹配。'],
     ['5. 标签用逗号分隔，最多 6 个。'],
@@ -986,13 +998,14 @@ function importModal(onDone) {
         const get = (k) => (idx[k] >= 0 ? String(r[idx[k]] || '').trim() : '');
         const title = maskSensitive(get('title'));
         const content = maskSensitive(get('content'));
-        const kind = get('kind') === '常识知识' ? '常识知识' : '故障案例';
-        const solution = kind === '故障案例' ? maskSensitive(get('solution')) : (get('solution') ? maskSensitive(get('solution')) : null);
+        const rawKind = get('kind');
+        const kind = KINDS.includes(rawKind) ? rawKind : '故障案例';
+        const solution = get('solution') ? maskSensitive(get('solution')) : null;
         const category = CATEGORIES.includes(get('category')) ? get('category') : '其他';
         const tags = get('tags').split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean).slice(0, 6);
         if (!title || !content) { errors.push(`第 ${rowNo} 行：标题或知识内容为空`); continue; }
         if (title.length > 80) { errors.push(`第 ${rowNo} 行：标题超过 80 字`); continue; }
-        if (kind === '故障案例' && !solution) { errors.push(`第 ${rowNo} 行：故障案例必须填写解决方案`); continue; }
+        if (kind !== '常识知识' && !solution) { errors.push(`第 ${rowNo} 行：${kind}必须填写解决方案`); continue; }
         if (seenTitles.has(title)) { errors.push(`第 ${rowNo} 行：标题「${title.slice(0, 30)}…」与库内/前面行重复，已跳过`); continue; }
         seenTitles.add(title);
         valid.push({
@@ -1011,7 +1024,7 @@ function importModal(onDone) {
       // 预览
       const previewRows = valid.slice(0, 8).map((v) => `
         <tr><td>${esc(v.title.slice(0, 26))}${v.title.length > 26 ? '…' : ''}</td>
-        <td>${plainTag(v.kind)}</td><td>${catTag(v.category)}</td>
+        <td>${kindTag(v.kind)}</td><td>${catTag(v.category)}</td>
         <td>${esc(v.product)}</td></tr>`).join('');
       box.innerHTML = `
         <div class="hint-strip ${errors.length ? '' : 'info'}">
@@ -1063,7 +1076,7 @@ async function viewItem(id) {
     const isKnowledge = it.kind === '常识知识';
     openModal(`
       <h3>${esc(it.title)}</h3>
-      <div class="kb-meta" style="margin-bottom:14px;">${isKnowledge ? plainTag('常识知识') : ''}${statusTag(it.status)}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
+      <div class="kb-meta" style="margin-bottom:14px;">${kindTag(it.kind)}${statusTag(it.status)}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
       <div class="detail-block"><div class="lbl">${isKnowledge ? '知识内容' : '问题描述 / 报错现象'}</div><div class="val">${esc(it.content)}</div></div>
       ${it.solution ? `<div class="detail-block"><div class="lbl">${isKnowledge ? '补充说明' : '解决方案 / 处理步骤'}</div><div class="val">${esc(it.solution)}</div></div>` : ''}
       <div class="detail-block"><div class="lbl">适用环境 / 版本</div><div class="val">${esc(it.environment || '通用')}${it.version ? ' · ' + esc(it.version) : ''}</div></div>
@@ -1108,12 +1121,13 @@ function itemForm(it, onSaved) {
       <button class="btn" type="button" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" id="f-save" type="button">${isEdit ? '保存' : '自动归类并入库'}</button>
     </div>`);
-  // 类型切换：常识知识可不填解决方案
+  // 类型切换：常识知识可不填解决方案；产品漏洞需填修复方案
   const kindSel = $('#f-kind');
   function syncKindUI() {
     const isK = kindSel.value === '常识知识';
     $('#f-sol-wrap').style.display = isK ? 'none' : '';
-    $('#f-content-lbl').textContent = isK ? '知识内容 *（概念、原理、最佳实践等）' : '问题描述 / 报错现象 *';
+    $('#f-content-lbl').textContent = isK ? '知识内容 *（概念、原理、最佳实践等）'
+      : kindSel.value === '产品漏洞' ? '漏洞描述 / 影响范围 *' : '问题描述 / 报错现象 *';
   }
   kindSel.addEventListener('change', syncKindUI);
   syncKindUI();
@@ -1126,8 +1140,8 @@ function itemForm(it, onSaved) {
     const content = $('#f-content').value.trim();
     const solution = $('#f-solution').value.trim();
     const product = $('#f-product').value.trim();
-    if (!title || !content || (kind === '故障案例' && !solution)) {
-      err.textContent = kind === '故障案例' ? '请填写标题、问题描述与解决方案' : '请填写标题与知识内容';
+    if (!title || !content || (kind !== '常识知识' && !solution)) {
+      err.textContent = kind === '常识知识' ? '请填写标题与知识内容' : '请填写标题、问题描述与解决方案';
       err.classList.remove('hidden');
       return;
     }
@@ -1290,7 +1304,7 @@ function renderAiEntries(entries, product, onDone, parseBtn) {
       <div class="card ai-entry" data-idx="${i}" style="margin-bottom:10px;">
         <div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;">
           <input type="checkbox" class="ai-check" checked />
-          <select class="ai-kind" style="width:120px;"><option ${e.kind === '故障案例' ? 'selected' : ''}>故障案例</option><option ${e.kind === '常识知识' ? 'selected' : ''}>常识知识</option></select>
+          <select class="ai-kind" style="width:120px;">${KINDS.map((k) => `<option ${k === (e.kind || '故障案例') ? 'selected' : ''}>${k}</option>`).join('')}</select>
           <input type="text" class="ai-title" maxlength="80" value="${esc(e.title)}" style="flex:1;" />
         </div>
         <textarea class="ai-content" style="min-height:60px;" placeholder="知识内容 / 问题描述">${esc(e.content)}</textarea>
@@ -1337,7 +1351,7 @@ function renderAiEntries(entries, product, onDone, parseBtn) {
         const title = maskSensitive(card.querySelector('.ai-title').value.trim());
         const content = maskSensitive(card.querySelector('.ai-content').value.trim());
         const solution = maskSensitive(card.querySelector('.ai-solution').value.trim());
-        if (!title || !content || (kind === '故障案例' && !solution)) { skipped++; continue; }
+        if (!title || !content || (kind !== '常识知识' && !solution)) { skipped++; continue; }
         if (seen.has(title)) { skipped++; continue; }
         seen.add(title);
         const rows = await DB.insertReport({
