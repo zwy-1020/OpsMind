@@ -34,12 +34,123 @@ const DB = (function () {
       if (filters.product) q = q.eq('product', filters.product);
       if (filters.category) q = q.eq('category', filters.category);
       if (filters.keyword) {
+        const kw = filters.keyword;
         q = q.or(
-          'title.ilike.%' + filters.keyword + '%,content.ilike.%' + filters.keyword + '%'
+          'title.ilike.%' + kw + '%,content.ilike.%' + kw + '%,error_code.ilike.%' + kw + '%'
         );
       }
     }
     return q.then((r) => unwrap(r, '查询知识库'));
+  }
+
+  // 统一过滤条件（分页查询 / 全量导出共用）
+  function applyFilters(q, filters) {
+    const f = filters || {};
+    if (f.status) q = q.eq('status', f.status);
+    if (f.kind) q = q.eq('kind', f.kind);
+    if (f.category) q = q.eq('category', f.category);
+    if (f.source) q = q.eq('source', f.source);
+    if (f.product) q = q.ilike('product', '%' + f.product + '%');
+    if (f.keyword) {
+      // 逗号/括号会破坏 PostgREST 的 or 语法，先归一为空格
+      const kw = String(f.keyword).replace(/[,()]/g, ' ').trim();
+      if (kw) {
+        q = q.or(
+          'title.ilike.%' + kw + '%,content.ilike.%' + kw + '%,error_code.ilike.%' + kw + '%'
+        );
+      }
+    }
+    return q;
+  }
+
+  // 服务端分页：返回 { rows, total }，total 为命中总数（与当前页无关）
+  function queryItems(filters, page, pageSize) {
+    const size = Math.min(500, Math.max(1, Number(pageSize) || 100));
+    const p = Math.max(1, Number(page) || 1);
+    const from = (p - 1) * size;
+    let q = cloud.database
+      .from('knowledge_items')
+      .select('*', { count: 'exact' })
+      .order('updated_at', { ascending: false })
+      .order('id', { ascending: false })
+      .range(from, from + size - 1);
+    q = applyFilters(q, filters);
+    return q.then((r) => {
+      if (r.error) unwrap(r, '查询知识库');
+      const rows = r.data || [];
+      return {
+        rows: rows,
+        total: typeof r.count === 'number' ? r.count : rows.length,
+        page: p,
+        pageSize: size
+      };
+    });
+  }
+
+  // 按当前筛选条件拉取全量（导出用，默认上限 5000 条）
+  async function listAll(filters, cap) {
+    const max = Math.max(1, Number(cap) || 5000);
+    const CHUNK = 500;
+    let out = [];
+    let p = 1;
+    for (;;) {
+      const res = await queryItems(filters, p, CHUNK);
+      out = out.concat(res.rows);
+      if (res.rows.length < CHUNK || out.length >= res.total || out.length >= max) break;
+      p += 1;
+    }
+    return out.slice(0, max);
+  }
+
+  // 仅取标题（导入查重用，避免拉全字段）
+  function listTitles(limit) {
+    return cloud.database
+      .from('knowledge_items')
+      .select('title')
+      .order('updated_at', { ascending: false })
+      .limit(Math.min(5000, Number(limit) || 2000))
+      .then((r) => (unwrap(r, '查询标题') || []).map((x) => x.title));
+  }
+
+  // 按 id 批量取整行（导出所选、批量编辑回显用）
+  function queryItemsByIds(ids) {
+    if (!ids || !ids.length) return Promise.resolve([]);
+    return cloud.database
+      .from('knowledge_items')
+      .select('*')
+      .in('id', ids)
+      .then((r) => unwrap(r, '查询条目'));
+  }
+
+  function getTagsByIds(ids) {
+    if (!ids || !ids.length) return Promise.resolve([]);
+    return cloud.database
+      .from('knowledge_items')
+      .select('id,tags')
+      .in('id', ids)
+      .then((r) => unwrap(r, '查询标签'));
+  }
+
+  // 批量更新（单次建议 ≤ 60 个 id，避免 URL 过长）
+  function updateItems(ids, patch) {
+    if (!ids || !ids.length) return Promise.resolve([]);
+    return cloud.database
+      .from('knowledge_items')
+      .update(patch)
+      .in('id', ids)
+      .select()
+      .then((r) => unwrap(r, '批量更新'));
+  }
+
+  // 批量删除（单次建议 ≤ 60 个 id）
+  function deleteItems(ids) {
+    if (!ids || !ids.length) return Promise.resolve([]);
+    return cloud.database
+      .from('knowledge_items')
+      .delete()
+      .in('id', ids)
+      .select()
+      .then((r) => unwrap(r, '批量删除'));
   }
 
   function getItem(id) {
@@ -178,6 +289,13 @@ const DB = (function () {
   return {
     listPublished,
     listVisible,
+    queryItems,
+    queryItemsByIds,
+    listAll,
+    listTitles,
+    getTagsByIds,
+    updateItems,
+    deleteItems,
     getItem,
     insertReport,
     updateItem,

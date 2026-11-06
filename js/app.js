@@ -62,7 +62,8 @@ function closeModal() { $('#modal-mask').classList.add('hidden'); }
 $('#modal-mask').addEventListener('click', (e) => { if (e.target === e.currentTarget) closeModal(); });
 
 async function refreshPublishedCache() {
-  state.publishedCache = await DB.listPublished(300);
+  // 问答检索语料：取引用/更新时间靠前的已发布条目（库大时也能覆盖主要知识）
+  state.publishedCache = await DB.listPublished(1000);
   return state.publishedCache;
 }
 window.App = {
@@ -200,11 +201,11 @@ async function renderAsk(view) {
   view.innerHTML = `
     <div class="ask-hero">
       <h2>运维智能问答</h2>
-      <p class="page-desc">用一句话描述故障现象，系统自动匹配知识库中最相似的历史案例（相似度阈值 0.85）</p>
+      <p class="page-desc">用一句话描述故障现象，或直接输入报错码（如 ORA-12541、1045、28P01），系统自动匹配知识库（相似度阈值 0.85；报错码精确命中优先）</p>
     </div>
     <div class="card">
       <div class="ask-box">
-        <textarea id="ask-input" maxlength="100" placeholder="例如：产品A 启动失败，报错 connection refused"></textarea>
+        <textarea id="ask-input" maxlength="100" placeholder="例如：产品A 启动失败，报错 connection refused；或直接输入 1045"></textarea>
         <button id="btn-ask" class="btn btn-primary" type="button">提问</button>
       </div>
       <div class="char-count"><span id="ask-count">0</span>/100 字（超出请使用问题上报入口提交完整报错）</div>
@@ -242,13 +243,20 @@ async function renderAsk(view) {
     try {
       if (!state.publishedCache) await refreshPublishedCache();
       const published = state.publishedCache || [];
-      // ① 本地字符级相似度召回 Top 10（检索不消耗大模型 Token）
-      const candidates = window.rankCandidates(question, published, 10).filter((c) => c.localScore > 0.03);
       let hits = [];
       let usedLLM = false;
       let llmError = null;
+      let exactMode = false;
+      // ① 报错码精确通道：命中库内同类错误码直接返回，不调用大模型（快、准、省额度）
+      const exactHits = (window.matchErrorCodes(question, published) || []).slice(0, 3);
+      if (exactHits.length) {
+        exactMode = true;
+        hits = exactHits.map((h) => ({ item: h.item, score: 1, exact: true, code: h.code }));
+      }
+      // ② 未命中错误码时走「本地召回 + 模型语义打分」
+      const candidates = exactMode ? [] : window.rankCandidates(question, published, 10).filter((c) => c.localScore > 0.03);
       if (candidates.length > 0) {
-        // ② 大模型语义打分（仅 Top 10 候选片段，控制 Token）
+        // 大模型语义打分（仅 Top 10 候选片段，控制 Token）
         try {
           const scoreMap = await LLM.scoreMatches(question, candidates.map((c) => ({
             id: c.item.id, title: c.item.title, content: c.item.content
@@ -273,9 +281,10 @@ async function renderAsk(view) {
       // 命中：引用计数 +1（热度统计）
       for (const h of hits) DB.incrementCite(h.item.id).catch(() => {});
       DB.logOperation(state.name, '智能问答', null, JSON.stringify({
-        question_len: question.length, hits: hits.length, mode: usedLLM ? 'llm' : 'lexical'
+        question_len: question.length, hits: hits.length,
+        mode: exactMode ? 'exact-code' : (usedLLM ? 'llm' : 'lexical')
       }));
-      renderAskResult(box, question, hits, { usedLLM, llmError });
+      renderAskResult(box, question, hits, { usedLLM, llmError, exactMode });
     } catch (e) {
       box.innerHTML = `<div class="card"><div class="hint-strip">问答失败：${esc(e.message)}</div></div>`;
     } finally {
@@ -320,9 +329,11 @@ function renderAskResult(box, question, hits, meta) {
     })();
     return;
   }
-  const note = meta.usedLLM
-    ? ''
-    : `<div class="hint-strip">大模型语义打分暂不可用（${esc(meta.llmError || '未知原因')}），已降级为关键词匹配，结果仅供参考。</div>`;
+  const note = meta.exactMode
+    ? `<div class="hint-strip info">已按<b>报错码精确匹配</b>命中知识库（无需调用大模型），以下为对应错误的标准处理步骤。</div>`
+    : meta.usedLLM
+      ? ''
+      : `<div class="hint-strip">大模型语义打分暂不可用（${esc(meta.llmError || '未知原因')}），已降级为关键词匹配，结果仅供参考。</div>`;
   box.innerHTML = note + hits.map((h) => {
     const it = h.item;
     const pct = Math.round(h.score * 100);
@@ -331,105 +342,574 @@ function renderAskResult(box, question, hits, meta) {
     const bodyHtml = isKnowledge
       ? `<div class="solution">${esc(it.content)}</div>${it.solution ? `<div class="kb-sub" style="margin-top:8px;">补充：${esc(it.solution)}</div>` : ''}`
       : `<div class="kb-sub">${esc(it.content)}</div><div class="solution">${esc(it.solution)}</div>`;
+    const badge = h.exact
+      ? `<span class="score-badge exact">精确命中 ${esc(h.code || it.error_code || '')}</span>`
+      : `<span class="score-badge${mid}">相似度 ${pct}%</span>`;
     return `
       <div class="card match-card">
         <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap;">
           <b>${esc(it.title)}</b>
-          <span class="score-badge${mid}">相似度 ${pct}%</span>
+          ${badge}
         </div>
-        <div class="kb-meta">${isKnowledge ? plainTag('常识知识') : ''}${catTag(it.category)}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
+        <div class="kb-meta">${isKnowledge ? plainTag('常识知识') : ''}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
         ${bodyHtml}
         <div class="match-source">来源：运维知识库/${esc(it.product || '未分类')}/${fmtDate(it.updated_at).slice(0, 7)} · 适用环境：${esc(it.environment || '通用')} · 更新时间：${fmtDate(it.updated_at)} · 被引用 ${it.cite_count || 0} 次</div>
       </div>`;
   }).join('');
 }
 
-/* ---------- 知识库列表 ---------- */
+/* ---------- 知识库列表：分页（默认 100 行/页）+ 批量导出/修改/删除 ---------- */
+const KB_PAGE_SIZES = [50, 100, 200];
+
 async function renderKb(view) {
   const isAdmin = state.role === 'admin';
+  const COLSPAN = isAdmin ? 7 : 6;
+  let page = 1;
+  let pageSize = Number(localStorage.getItem('kb_page_size')) || 100;
+  if (!KB_PAGE_SIZES.includes(pageSize)) pageSize = 100;
+  let total = 0;
+  let rows = [];
+  const selected = new Map(); // id -> title（跨页保留，改筛选条件时清空）
+
   view.innerHTML = `
     <div class="page-title">知识库</div>
-    <p class="page-desc">按产品、模块、故障分类检索已沉淀的排障案例${isAdmin ? '，可编辑、删除或新增录入' : ''}</p>
+    <p class="page-desc">按产品、模块、故障分类检索已沉淀的排障案例${isAdmin ? '；支持批量导出、批量导入、批量修改与批量删除' : '，可按条件批量导出'}</p>
     <div class="toolbar">
-      <input type="search" id="kb-kw" placeholder="搜索标题 / 报错关键字" />
+      <input type="search" id="kb-kw" placeholder="搜索标题 / 内容 / 报错码" />
       <select id="kb-cat"><option value="">全部分类</option>${CATEGORIES.map((c) => `<option>${c}</option>`).join('')}</select>
-      <input type="text" id="kb-product" placeholder="按产品过滤" style="width:150px" />
+      <select id="kb-kind"><option value="">全部类型</option>${KINDS.map((k) => `<option>${k}</option>`).join('')}</select>
+      <input type="text" id="kb-product" placeholder="按产品过滤" style="width:140px" />
       ${isAdmin ? `<select id="kb-status"><option value="">全部状态</option>${STATUSES.map((s) => `<option>${s}</option>`).join('')}</select>` : ''}
       <button id="btn-kb-search" class="btn btn-primary" type="button">检索</button>
-      ${isAdmin ? `<button id="btn-kb-tpl" class="btn" type="button">下载模板</button>
-      <button id="btn-kb-import" class="btn" type="button">批量导入</button>
-      <button id="btn-kb-ai" class="btn" type="button">AI 智能入库</button>
-      <button id="btn-kb-new" class="btn" type="button">新增录入</button>` : ''}
+      <button id="btn-kb-reset" class="btn" type="button">重置</button>
     </div>
-    <div class="card"><div id="kb-list"><div class="loading"><div class="spinner"></div>加载中…</div></div></div>`;
+    <div class="toolbar kb-actionbar">
+      <div class="kb-total">共 <b id="kb-total">—</b> 条</div>
+      <div class="kb-actionbar-btns">
+        ${isAdmin ? `<button id="btn-kb-tpl" class="btn" type="button">下载模板</button>
+        <button id="btn-kb-import" class="btn" type="button">批量导入</button>` : ''}
+        <button id="btn-kb-export" class="btn" type="button">批量导出</button>
+        ${isAdmin ? `<button id="btn-kb-ai" class="btn" type="button">AI 智能入库</button>
+        <button id="btn-kb-new" class="btn btn-primary" type="button">新增录入</button>` : ''}
+      </div>
+    </div>
+    <div class="card kb-table-card">
+      <div id="kb-bulkbar" class="bulkbar hidden">
+        <span class="bulkbar-info">已选 <b id="kb-selcount">0</b> 条</span>
+        <div class="bulkbar-btns">
+          <button id="btn-bulk-edit" class="btn btn-sm" type="button">批量修改</button>
+          <button id="btn-bulk-export" class="btn btn-sm" type="button">导出所选</button>
+          <button id="btn-bulk-del" class="btn btn-sm btn-danger" type="button">批量删除</button>
+          <button id="btn-bulk-clear" class="btn btn-sm btn-ghost" type="button">清空选择</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="tbl kb-tbl">
+          <thead><tr>
+            ${isAdmin ? `<th class="col-check"><input type="checkbox" id="kb-check-all" title="全选当前页" /></th>` : ''}
+            <th>标题</th>
+            <th>报错码</th>
+            <th>状态</th>
+            <th class="col-num">引用</th>
+            <th>更新时间</th>
+            <th class="col-act">操作</th>
+          </tr></thead>
+          <tbody id="kb-tbody"></tbody>
+        </table>
+      </div>
+      <div id="kb-pager" class="pager"></div>
+    </div>`;
 
-  async function load() {
-    const list = $('#kb-list');
-    list.innerHTML = '<div class="loading"><div class="spinner"></div>加载中…</div>';
-    try {
-      const filters = {
-        keyword: $('#kb-kw').value.trim(),
-        category: $('#kb-cat').value,
-        product: $('#kb-product').value.trim() || null,
-        limit: 200
-      };
-      const statusEl = $('#kb-status');
-      if (statusEl && statusEl.value) filters.status = statusEl.value;
-      else if (!isAdmin) filters.status = '已发布';
-      const rows = await DB.listVisible(filters);
-      if (!rows.length) { list.innerHTML = '<div class="empty">暂无符合条件的知识条目</div>'; return; }
-      list.innerHTML = rows.map((it) => `
-        <div class="kb-row">
-          <div class="kb-main">
-            <div class="kb-title" data-id="${it.id}">${esc(it.title)}</div>
-            <div class="kb-sub">${esc(String(it.content || '').slice(0, 80))}${String(it.content || '').length > 80 ? '…' : ''}</div>
-            <div class="kb-meta">${it.kind === '常识知识' ? plainTag('常识知识') : ''}${statusTag(it.status)}${catTag(it.category)}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}${(it.tags || []).slice(0, 4).map(plainTag).join('')}</div>
-            <div class="kb-sub">引用 ${it.cite_count || 0} 次 · 更新 ${fmtDate(it.updated_at)}${it.reporter ? ' · 上报人 ' + esc(it.reporter) : ''}</div>
-          </div>
-          <div class="kb-actions">
-            <button class="btn btn-sm btn-view" data-id="${it.id}" type="button">查看</button>
-            ${isAdmin ? `<button class="btn btn-sm btn-edit" data-id="${it.id}" type="button">编辑</button>
-            <button class="btn btn-sm btn-del" data-id="${it.id}" type="button">删除</button>` : ''}
-          </div>
-        </div>`).join('');
-      list.querySelectorAll('.kb-title, .btn-view').forEach((el) => {
-        el.addEventListener('click', () => viewItem(Number(el.dataset.id)));
-      });
-      list.querySelectorAll('.btn-edit').forEach((el) => {
-        el.addEventListener('click', () => editItem(Number(el.dataset.id), () => load()));
-      });
-      list.querySelectorAll('.btn-del').forEach((el) => {
-        el.addEventListener('click', () => confirmDelete(Number(el.dataset.id), () => load()));
-      });
-    } catch (e) {
-      list.innerHTML = `<div class="hint-strip">加载失败：${esc(e.message)}</div>`;
+  const tbody = $('#kb-tbody');
+
+  function buildFilters() {
+    const f = {
+      keyword: $('#kb-kw').value.trim(),
+      category: $('#kb-cat').value,
+      kind: $('#kb-kind').value,
+      product: $('#kb-product').value.trim() || null
+    };
+    const statusEl = $('#kb-status');
+    if (statusEl && statusEl.value) f.status = statusEl.value;
+    else if (!isAdmin) f.status = '已发布';
+    return f;
+  }
+
+  function syncSelection() {
+    const n = selected.size;
+    $('#kb-selcount').textContent = n;
+    $('#kb-bulkbar').classList.toggle('hidden', n === 0 || !isAdmin);
+    const all = $('#kb-check-all');
+    if (all) {
+      const ids = rows.map((r) => r.id);
+      const hit = ids.filter((id) => selected.has(id)).length;
+      all.checked = ids.length > 0 && hit === ids.length;
+      all.indeterminate = hit > 0 && hit < ids.length;
     }
   }
-  $('#btn-kb-search').addEventListener('click', load);
-  $('#kb-kw').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+
+  function renderTable() {
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="${COLSPAN}"><div class="empty">暂无符合条件的知识条目</div></td></tr>`;
+      syncSelection();
+      return;
+    }
+    tbody.innerHTML = rows.map((it) => {
+      const isK = it.kind === '常识知识';
+      const checked = selected.has(it.id);
+      return `<tr class="${checked ? 'row-sel' : ''}" data-id="${it.id}">
+        ${isAdmin ? `<td class="col-check"><input type="checkbox" class="kb-check" data-id="${it.id}" data-title="${esc(it.title)}" ${checked ? 'checked' : ''} /></td>` : ''}
+        <td class="col-title">
+          <div class="kb-title" data-id="${it.id}">${esc(it.title)}</div>
+          <div class="kb-meta">${isK ? plainTag('常识知识') : ''}${catTag(it.category)}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}${(it.tags || []).slice(0, 3).map(plainTag).join('')}</div>
+        </td>
+        <td>${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : '<span class="muted">-</span>'}</td>
+        <td>${statusTag(it.status)}</td>
+        <td class="col-num">${it.cite_count || 0}</td>
+        <td class="col-time">${fmtDate(it.updated_at)}</td>
+        <td class="col-act">
+          <button class="btn btn-sm btn-view" data-id="${it.id}" type="button">查看</button>
+          ${isAdmin ? `<button class="btn btn-sm btn-edit" data-id="${it.id}" type="button">编辑</button>
+          <button class="btn btn-sm btn-del" data-id="${it.id}" type="button">删除</button>` : ''}
+        </td>
+      </tr>`;
+    }).join('');
+    syncSelection();
+  }
+
+  function pageNumbers(cur, pages) {
+    if (pages <= 7) return Array.from({ length: pages }, (_, i) => i + 1);
+    const set = new Set([1, pages, cur, cur - 1, cur + 1]);
+    if (cur <= 4) [2, 3, 4, 5].forEach((n) => set.add(n));
+    if (cur >= pages - 3) [pages - 4, pages - 3, pages - 2, pages - 1].forEach((n) => set.add(n));
+    const arr = Array.from(set).filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+    const out = [];
+    arr.forEach((n, i) => {
+      if (i > 0 && n - arr[i - 1] > 1) out.push('...');
+      out.push(n);
+    });
+    return out;
+  }
+
+  function renderPager() {
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    const nums = pageNumbers(page, pages);
+    $('#kb-pager').innerHTML = `
+      <div class="pager-info">共 <b>${total}</b> 条 · 第 <b>${page}</b>/${pages} 页 · 每页 ${pageSize} 行${selected.size ? ` · 已选 ${selected.size} 条` : ''}</div>
+      <div class="pager-ctrl">
+        <select id="kb-pagesize" title="每页行数">${KB_PAGE_SIZES.map((s) => `<option value="${s}" ${s === pageSize ? 'selected' : ''}>${s} 行/页</option>`).join('')}</select>
+        <button class="btn btn-sm" data-page="1" type="button" ${page <= 1 ? 'disabled' : ''}>首页</button>
+        <button class="btn btn-sm" data-page="${page - 1}" type="button" ${page <= 1 ? 'disabled' : ''}>上一页</button>
+        ${nums.map((n) => n === '...'
+          ? '<span class="pager-dots">…</span>'
+          : `<button class="btn btn-sm pager-num ${n === page ? 'btn-primary' : ''}" data-page="${n}" type="button">${n}</button>`).join('')}
+        <button class="btn btn-sm" data-page="${page + 1}" type="button" ${page >= pages ? 'disabled' : ''}>下一页</button>
+        <button class="btn btn-sm" data-page="${pages}" type="button" ${page >= pages ? 'disabled' : ''}>末页</button>
+      </div>`;
+  }
+
+  async function load(resetPage) {
+    if (resetPage) page = 1;
+    tbody.innerHTML = `<tr><td colspan="${COLSPAN}"><div class="loading"><div class="spinner"></div>加载中…</div></td></tr>`;
+    $('#kb-pager').innerHTML = '';
+    try {
+      const res = await DB.queryItems(buildFilters(), page, pageSize);
+      total = res.total;
+      const pages = Math.max(1, Math.ceil(total / Math.max(1, pageSize)));
+      if (page > pages) { page = pages; return load(); }
+      rows = res.rows;
+      $('#kb-total').textContent = total;
+      renderTable();
+      renderPager();
+    } catch (e) {
+      tbody.innerHTML = `<tr><td colspan="${COLSPAN}"><div class="hint-strip">加载失败：${esc(e.message)}</div></td></tr>`;
+    }
+  }
+
+  // 行内操作（事件委托，100 行也只挂一次监听）
+  tbody.addEventListener('click', (e) => {
+    const t = e.target.closest('button, .kb-title');
+    if (!t || !tbody.contains(t)) return;
+    const id = Number(t.dataset.id);
+    if (!id) return;
+    if (t.classList.contains('btn-view') || t.classList.contains('kb-title')) { viewItem(id); return; }
+    if (t.classList.contains('btn-edit')) { editItem(id, () => load()); return; }
+    if (t.classList.contains('btn-del')) {
+      confirmDelete(id, () => {
+        selected.delete(id);
+        load();
+      });
+    }
+  });
+  tbody.addEventListener('change', (e) => {
+    const cb = e.target.closest('.kb-check');
+    if (!cb) return;
+    const id = Number(cb.dataset.id);
+    if (cb.checked) selected.set(id, cb.dataset.title || '');
+    else selected.delete(id);
+    const tr = cb.closest('tr');
+    if (tr) tr.classList.toggle('row-sel', cb.checked);
+    syncSelection();
+    if (total) renderPager();
+  });
+
+  const checkAll = $('#kb-check-all');
+  if (checkAll) {
+    checkAll.addEventListener('change', () => {
+      rows.forEach((r) => {
+        if (checkAll.checked) selected.set(r.id, r.title);
+        else selected.delete(r.id);
+      });
+      renderTable();
+      renderPager();
+    });
+  }
+
+  $('#kb-pager').addEventListener('click', (e) => {
+    const b = e.target.closest('button[data-page]');
+    if (!b || b.disabled) return;
+    const p = Number(b.dataset.page);
+    if (!p || p === page) return;
+    page = p;
+    load();
+    document.querySelector('.kb-table-card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  $('#kb-pager').addEventListener('change', (e) => {
+    if (e.target.id !== 'kb-pagesize') return;
+    pageSize = Number(e.target.value) || 100;
+    localStorage.setItem('kb_page_size', String(pageSize));
+    load(true);
+  });
+
+  $('#btn-kb-search').addEventListener('click', () => { selected.clear(); load(true); });
+  $('#btn-kb-reset').addEventListener('click', () => {
+    $('#kb-kw').value = '';
+    $('#kb-cat').value = '';
+    $('#kb-kind').value = '';
+    $('#kb-product').value = '';
+    const st = $('#kb-status');
+    if (st) st.value = '';
+    selected.clear();
+    load(true);
+  });
+  $('#kb-kw').addEventListener('keydown', (e) => { if (e.key === 'Enter') { selected.clear(); load(true); } });
+  $('#kb-product').addEventListener('keydown', (e) => { if (e.key === 'Enter') { selected.clear(); load(true); } });
+
   const newBtn = $('#btn-kb-new');
   if (newBtn) newBtn.addEventListener('click', () => createItem(() => load()));
   const tplBtn = $('#btn-kb-tpl');
   if (tplBtn) tplBtn.addEventListener('click', downloadTemplate);
   const importBtn = $('#btn-kb-import');
-  if (importBtn) importBtn.addEventListener('click', () => importModal(() => load()));
+  if (importBtn) importBtn.addEventListener('click', () => importModal(() => load(true)));
   const aiBtn = $('#btn-kb-ai');
-  if (aiBtn) aiBtn.addEventListener('click', () => aiIngestModal(() => load()));
-  await load();
+  if (aiBtn) aiBtn.addEventListener('click', () => aiIngestModal(() => load(true)));
+
+  // 批量操作
+  $('#btn-kb-export').addEventListener('click', () => {
+    kbExportModal({
+      filters: buildFilters(),
+      total: total,
+      selectedIds: Array.from(selected.keys())
+    });
+  });
+  $('#btn-bulk-clear').addEventListener('click', () => {
+    selected.clear();
+    renderTable();
+    renderPager();
+  });
+  $('#btn-bulk-export').addEventListener('click', () => {
+    kbExportModal({
+      filters: buildFilters(),
+      total: total,
+      selectedIds: Array.from(selected.keys())
+    });
+  });
+  $('#btn-bulk-edit').addEventListener('click', () => {
+    if (!selected.size) return;
+    kbBatchEditModal(new Map(selected), () => { selected.clear(); load(); });
+  });
+  $('#btn-bulk-del').addEventListener('click', () => {
+    if (!selected.size) return;
+    kbBatchDeleteModal(new Map(selected), () => {
+      selected.clear();
+      load();
+    });
+  });
+
+  await load(true);
+}
+
+/* ---------- 批量导出（Excel，列与导入模板一致，可直接再导入） ---------- */
+function kbExportModal(opts) {
+  const nSel = (opts.selectedIds || []).length;
+  openModal(`
+    <h3>批量导出知识条目</h3>
+    <p style="color:var(--text-2);line-height:1.8;">
+      导出为 Excel（.xlsx），列与「批量导入模板」完全一致，导出的文件可直接再导入本系统。<br/>
+      当前筛选条件命中 <b>${opts.total}</b> 条${nSel ? `，已勾选 <b>${nSel}</b> 条` : ''}。
+    </p>
+    <div class="hint-strip info">状态、引用次数等运行元数据不在模板列中：重新导入时状态统一为「已发布」、引用次数从 0 开始。</div>
+    <div class="modal-actions" style="justify-content:space-between;">
+      <button class="btn" type="button" onclick="closeModal()">取消</button>
+      <div style="display:flex;gap:10px;">
+        ${nSel ? `<button class="btn" id="exp-sel" type="button">仅导出已选 ${nSel} 条</button>` : ''}
+        <button class="btn btn-primary" id="exp-all" type="button">导出全部 ${opts.total} 条</button>
+      </div>
+    </div>`);
+  const run = async (useSelected) => {
+    try {
+      let list;
+      if (useSelected) {
+        const ids = opts.selectedIds.slice();
+        list = [];
+        for (let i = 0; i < ids.length; i += 60) {
+          const chunk = ids.slice(i, i + 60);
+          const part = await DB.queryItemsByIds(chunk);
+          list = list.concat(part);
+        }
+        // 保持与列表一致的排序：按当前筛选顺序无意义，按标题稳定
+        list.sort((a, b) => String(a.title).localeCompare(String(b.title), 'zh'));
+      } else {
+        toast('正在读取数据…');
+        list = await DB.listAll(opts.filters, 5000);
+      }
+      if (!list.length) { toast('没有可导出的条目', true); return; }
+      exportKbExcel(list, { total: opts.total, selected: useSelected });
+      closeModal();
+    } catch (e) {
+      toast('导出失败：' + e.message, true);
+    }
+  };
+  const allBtn = $('#exp-all');
+  if (allBtn) allBtn.addEventListener('click', () => run(false));
+  const selBtn = $('#exp-sel');
+  if (selBtn) selBtn.addEventListener('click', () => run(true));
+}
+
+function exportKbExcel(list, meta) {
+  if (typeof XLSX === 'undefined') { toast('Excel 组件未加载，请刷新重试', true); return; }
+  const aoa = [TPL_HEADERS].concat(list.map((it) => [
+    it.title || '',
+    it.kind || '故障案例',
+    it.content || '',
+    it.solution || '',
+    it.error_code || '',
+    it.product || '',
+    it.module || '',
+    it.category || '其他',
+    it.environment || '',
+    it.version || '',
+    (it.tags || []).join(',')
+  ]));
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = [{ wch: 38 }, { wch: 10 }, { wch: 50 }, { wch: 50 }, { wch: 14 }, { wch: 12 }, { wch: 12 }, { wch: 10 }, { wch: 16 }, { wch: 10 }, { wch: 22 }];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '知识库');
+  const now = new Date();
+  const note = XLSX.utils.aoa_to_sheet([
+    ['导出说明'],
+    ['导出时间', fmtDate(now.toISOString())],
+    ['操作人', state.name || ''],
+    ['导出范围', meta && meta.selected ? '已勾选条目' : '当前筛选条件下的全部条目'],
+    ['导出条数', String(list.length)],
+    ['再导入提示', '本文件列与批量导入模板一致，可直接用于「批量导入」；导入后状态为「已发布」，引用次数从 0 开始。'],
+    ['脱敏说明', '导出内容为库内已脱敏数据（IP 保留首段，账号/密码/密钥替换为 ***）。']
+  ]);
+  note['!cols'] = [{ wch: 14 }, { wch: 90 }];
+  XLSX.utils.book_append_sheet(wb, note, '导出说明');
+  const p = (n) => String(n).padStart(2, '0');
+  const name = `知识库导出_${now.getFullYear()}${p(now.getMonth() + 1)}${p(now.getDate())}_${p(now.getHours())}${p(now.getMinutes())}.xlsx`;
+  XLSX.writeFile(wb, name);
+  DB.logOperation(state.name, '批量导出', null, `导出 ${list.length} 条${meta && meta.selected ? '（已选）' : '（筛选）'}`);
+  toast(`已导出 ${list.length} 条：${name}`);
+}
+
+/* ---------- 批量修改（仅管理员） ---------- */
+function kbBatchEditModal(selectedMap, onDone) {
+  const ids = Array.from(selectedMap.keys());
+  const n = ids.length;
+  const none = (label) => `<option value="">不修改</option>`;
+  openModal(`
+    <h3>批量修改 ${n} 条知识</h3>
+    <p style="color:var(--text-2);line-height:1.8;margin-bottom:4px;">
+      只写入你填写或选择过的字段，保持「不修改」的字段不受影响。所有被修改条目统一记录审核人「${esc(state.name)}」与当前时间。
+    </p>
+    <div class="form-row">
+      <div><label>状态</label><select id="be-status">${none()}${STATUSES.map((s) => `<option>${s}</option>`).join('')}</select></div>
+      <div><label>条目类型</label><select id="be-kind">${none()}${KINDS.map((k) => `<option>${k}</option>`).join('')}</select></div>
+    </div>
+    <div class="form-row">
+      <div><label>故障分类</label><select id="be-cat">${none()}${CATEGORIES.map((c) => `<option>${c}</option>`).join('')}</select></div>
+      <div><label>所属产品</label><input type="text" id="be-product" placeholder="留空则不修改" /></div>
+    </div>
+    <div class="form-row">
+      <div><label>所属模块</label><input type="text" id="be-module" placeholder="留空则不修改" /></div>
+      <div><label>适用环境</label><input type="text" id="be-env" placeholder="留空则不修改" /></div>
+    </div>
+    <div class="form-row">
+      <div><label>标签处理方式</label><select id="be-tagmode">
+        <option value="">不修改</option>
+        <option value="append">追加到原标签</option>
+        <option value="replace">覆盖原标签</option>
+      </select></div>
+      <div><label>标签（逗号分隔，≤ 6 个）</label><input type="text" id="be-tags" placeholder="如：aisort,安装" /></div>
+    </div>
+    <div id="be-err" class="field-error hidden"></div>
+    <div class="modal-actions">
+      <button class="btn" type="button" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="be-ok" type="button">应用到 ${n} 条</button>
+    </div>`);
+
+  $('#be-ok').addEventListener('click', async () => {
+    const errEl = $('#be-err');
+    errEl.classList.add('hidden');
+    const status = $('#be-status').value;
+    const kind = $('#be-kind').value;
+    const category = $('#be-cat').value;
+    const product = $('#be-product').value.trim();
+    const module = $('#be-module').value.trim();
+    const env = $('#be-env').value.trim();
+    const tagMode = $('#be-tagmode').value;
+    const tags = $('#be-tags').value.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean).slice(0, 6);
+
+    if (!status && !kind && !category && !product && !module && !env && !tagMode) {
+      errEl.textContent = '请至少修改一个字段';
+      errEl.classList.remove('hidden');
+      return;
+    }
+    if (tagMode && !tags.length) {
+      errEl.textContent = '选择了标签处理方式，请填写标签内容';
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    const btn = $('#be-ok');
+    btn.disabled = true;
+    btn.textContent = '处理中…';
+    const now = new Date().toISOString();
+    const patch = { auditor: state.name, updated_at: now };
+    if (status) { patch.status = status; if (status === '已发布') patch.audit_time = now; }
+    if (kind) patch.kind = kind;
+    if (category) patch.category = category;
+    if (product) patch.product = maskSensitive(product);
+    if (module) patch.module = maskSensitive(module);
+    if (env) patch.environment = maskSensitive(env);
+
+    try {
+      let affected = 0;
+      if (tagMode) {
+        // 分块读取原标签（避免一次 in 太多 id 导致 URL 过长）
+        let rowsNow = [];
+        for (let i = 0; i < ids.length; i += 100) {
+          rowsNow = rowsNow.concat(await DB.getTagsByIds(ids.slice(i, i + 100)));
+        }
+        const byKey = groupIdsByTags(rowsNow, ids, tagMode, tags);
+        for (const [key, gids] of byKey) {
+          await DB.updateItems(gids, Object.assign({}, patch, { tags: key ? key.split('\u0001') : [] }));
+          affected += gids.length;
+        }
+      } else {
+        for (let i = 0; i < ids.length; i += 60) {
+          const chunk = ids.slice(i, i + 60);
+          const res = await DB.updateItems(chunk, patch);
+          affected += Array.isArray(res) ? res.length : chunk.length;
+        }
+      }
+      const detail = Object.keys(patch).filter((k) => k !== 'updated_at' && k !== 'auditor')
+        .map((k) => k + '=' + JSON.stringify(patch[k])).join(' ');
+      await DB.logOperation(state.name, '批量修改', null, `${affected}/${n} 条 ${detail}${tagMode ? ' 标签:' + tagMode + ':' + tags.join(',') : ''}`);
+      toast(`已批量更新 ${affected} 条`);
+      closeModal();
+      await refreshPublishedCache().catch(() => {});
+      await refreshPendingCount();
+      onDone && onDone();
+    } catch (e) {
+      errEl.textContent = e.message;
+      errEl.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = `应用到 ${n} 条`;
+    }
+  });
+}
+
+// 按「合并后的标签串」分组，相同标签的条目可一次 update，显著减少请求数
+function groupIdsByTags(rowsNow, allIds, mode, tags) {
+  const map = new Map();
+  const known = new Set();
+  for (const r of rowsNow) {
+    known.add(r.id);
+    let merged;
+    if (mode === 'append') merged = Array.from(new Set([...(r.tags || []), ...tags])).slice(0, 6);
+    else merged = tags.slice(0, 6);
+    const key = merged.join('\u0001');
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r.id);
+  }
+  // 未被读到（理论上不会发生）的 id 也按目标标签处理
+  const rest = allIds.filter((id) => !known.has(id));
+  if (rest.length) {
+    const key = tags.join('\u0001');
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(...rest);
+  }
+  return map;
+}
+
+/* ---------- 批量删除（仅管理员，二次确认） ---------- */
+function kbBatchDeleteModal(selectedMap, onDone) {
+  const entries = Array.from(selectedMap.entries());
+  const n = entries.length;
+  const sample = entries.slice(0, 6).map(([, title]) => `<li>${esc(title || '（无标题）')}</li>`).join('');
+  openModal(`
+    <h3>批量删除 ${n} 条知识</h3>
+    <p style="line-height:1.8;color:var(--danger);"><b>删除后不可恢复</b>，操作会记入操作日志。</p>
+    <div class="detail-block"><div class="lbl">将被删除的条目（前 6 条）</div>
+      <ul class="del-list">${sample}</ul>
+      ${n > 6 ? `<div class="kb-sub">…等共 ${n} 条</div>` : ''}
+    </div>
+    <div class="modal-actions">
+      <button class="btn" type="button" onclick="closeModal()">取消</button>
+      <button class="btn btn-danger" id="bd-ok" type="button">确认删除 ${n} 条</button>
+    </div>`);
+  $('#bd-ok').addEventListener('click', async () => {
+    const btn = $('#bd-ok');
+    btn.disabled = true;
+    btn.textContent = '删除中…';
+    const ids = entries.map(([id]) => id);
+    try {
+      let deleted = 0;
+      for (let i = 0; i < ids.length; i += 50) {
+        const chunk = ids.slice(i, i + 50);
+        const res = await DB.deleteItems(chunk);
+        deleted += Array.isArray(res) ? res.length : chunk.length;
+      }
+      await DB.logOperation(state.name, '批量删除', null, `删除 ${deleted} 条`);
+      toast(`已删除 ${deleted} 条${deleted < n ? `，${n - deleted} 条未删除（可能已不存在或无权限）` : ''}`);
+      closeModal();
+      await refreshPublishedCache().catch(() => {});
+      await refreshPendingCount();
+      onDone && onDone();
+    } catch (e) {
+      toast(e.message, true);
+      btn.disabled = false;
+      btn.textContent = `确认删除 ${n} 条`;
+    }
+  });
 }
 
 /* ---------- Excel 模板下载与批量导入（管理员） ---------- */
-const TPL_HEADERS = ['标题*', '类型', '知识内容/问题描述*', '解决方案(故障案例必填)', '所属产品', '所属模块', '故障分类', '适用环境', '适用版本', '标签(逗号分隔)'];
+const TPL_HEADERS = ['标题*', '类型', '知识内容/问题描述*', '解决方案(故障案例必填)', '报错码', '所属产品', '所属模块', '故障分类', '适用环境', '适用版本', '标签(逗号分隔)'];
 
 function downloadTemplate() {
   if (typeof XLSX === 'undefined') { toast('Excel 组件未加载，请刷新重试', true); return; }
   const rows = [
     TPL_HEADERS,
-    ['产品A 启动失败 - connection refused', '故障案例', '产品A 服务启动时报错 connection refused，无法连接依赖的数据库端口，服务反复重启。', '① 检查目标端口是否监听；② 查看服务日志确认依赖是否就绪；③ 重启服务。', '产品A', '服务启动', '网络', '生产环境 / Linux', 'v2.x', 'connection refused,端口,启动失败'],
-    ['什么是 inode', '常识知识', 'inode 是 Linux 文件系统的索引节点，存储文件的元数据（权限、大小、时间戳、数据块位置）。每个文件占用一个 inode，inode 耗尽后即使磁盘有空间也无法创建新文件，可用 df -i 查看。', '', 'Linux', '文件系统', '系统', '通用', '', 'inode,linux,文件系统']
+    ['产品A 启动失败 - connection refused', '故障案例', '产品A 服务启动时报错 connection refused，无法连接依赖的数据库端口，服务反复重启。', '① 检查目标端口是否监听；② 查看服务日志确认依赖是否就绪；③ 重启服务。', '', '产品A', '服务启动', '网络', '生产环境 / Linux', 'v2.x', 'connection refused,端口,启动失败'],
+    ['MySQL 1045：Access denied for user 登录被拒', '故障案例', '连接 MySQL 报 ERROR 1045 (28000) Access denied for user，密码确认无误仍无法登录。', '① 查看 mysql.user 中账号对应 host 是否包含来源 IP；② 重置密码；③ 确认认证插件 caching_sha2_password 与客户端驱动兼容。', '1045', 'MySQL', '连接与权限', '数据库', '生产环境', 'MySQL 5.7/8.0', '1045,登录失败,权限'],
+    ['什么是 inode', '常识知识', 'inode 是 Linux 文件系统的索引节点，存储文件的元数据（权限、大小、时间戳、数据块位置）。每个文件占用一个 inode，inode 耗尽后即使磁盘有空间也无法创建新文件，可用 df -i 查看。', '', '', 'Linux', '文件系统', '系统', '通用', '', 'inode,linux,文件系统']
   ];
   const ws = XLSX.utils.aoa_to_sheet(rows);
-  ws['!cols'] = TPL_HEADERS.map((h, i) => ({ wch: [38, 10, 50, 50, 12, 12, 10, 16, 10, 22][i] }));
+  ws['!cols'] = TPL_HEADERS.map((h, i) => ({ wch: [38, 10, 50, 50, 14, 12, 12, 10, 16, 10, 22][i] }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, '知识库');
   // 说明页
@@ -438,10 +918,11 @@ function downloadTemplate() {
     ['1. 带 * 为必填列：标题、知识内容/问题描述。类型为"故障案例"时解决方案必填。'],
     ['2. 类型只允许填：故障案例 / 常识知识（常识知识=基本概念、原理、最佳实践，可不填解决方案）。'],
     ['3. 故障分类只允许填：数据库 / 网络 / 系统 / 应用 / 中间件 / 其他，其他值将归为"其他"。'],
-    ['4. 标签用逗号分隔，最多 6 个。'],
-    ['5. 请勿在内容中放置真实 IP、账号、密码、密钥；系统导入时会自动脱敏（IP 保留首段，凭据值替换为 ***）。'],
-    ['6. 标题与库内已有条目重复的行会被跳过；同一次导入中标题重复的行也只保留第一条。'],
-    ['7. 导入后条目立即发布（来源：管理员录入），可在知识库列表中编辑或删除。']
+    ['4. 报错码列用于精确命中：一行可填多个码，用逗号分隔（如 ORA-12541,ORA-12170 / 1045 / 28P01）。用户提问含该码时直接命中本条，无需大模型语义匹配。'],
+    ['5. 标签用逗号分隔，最多 6 个。'],
+    ['6. 请勿在内容中放置真实 IP、账号、密码、密钥；系统导入时会自动脱敏（IP 保留首段，凭据值替换为 ***）。'],
+    ['7. 标题与库内已有条目重复的行会被跳过；同一次导入中标题重复的行也只保留第一条。'],
+    ['8. 导入后条目立即发布（来源：管理员录入），可在知识库列表中编辑或删除。']
   ]);
   help['!cols'] = [{ wch: 90 }];
   XLSX.utils.book_append_sheet(wb, help, '填写说明');
@@ -486,7 +967,7 @@ function importModal(onDone) {
       };
       const idx = {
         title: col(['标题']), kind: col(['类型']), content: col(['知识内容/问题描述', '问题描述', '知识内容']),
-        solution: col(['解决方案']), product: col(['所属产品']), module: col(['所属模块']),
+        solution: col(['解决方案']), code: col(['报错码', '错误码', '错误代码']), product: col(['所属产品']), module: col(['所属模块']),
         category: col(['故障分类']), env: col(['适用环境']), version: col(['适用版本']), tags: col(['标签'])
       };
       if (idx.title < 0 || idx.content < 0) {
@@ -495,9 +976,8 @@ function importModal(onDone) {
       const dataRows = grid.slice(1).filter((r) => r.some((c) => String(c).trim() !== ''));
       if (!dataRows.length) throw new Error('没有数据行');
 
-      // 解析 + 校验
-      const existing = await DB.listVisible({ limit: 500 });
-      const seenTitles = new Set(existing.map((r) => r.title));
+      // 解析 + 校验（查重只取标题，支持大库）
+      const seenTitles = new Set(await DB.listTitles(3000));
       const valid = [];
       const errors = [];
       for (let i = 0; i < dataRows.length; i++) {
@@ -520,6 +1000,7 @@ function importModal(onDone) {
           product: maskSensitive(get('product')) || '未分类',
           module: maskSensitive(get('module')) || null,
           category, tags,
+          error_code: get('code') || null,
           environment: maskSensitive(get('env')) || null,
           version: get('version') || null,
           kind, source: '管理员录入', status: '已发布',
@@ -582,7 +1063,7 @@ async function viewItem(id) {
     const isKnowledge = it.kind === '常识知识';
     openModal(`
       <h3>${esc(it.title)}</h3>
-      <div class="kb-meta" style="margin-bottom:14px;">${isKnowledge ? plainTag('常识知识') : ''}${statusTag(it.status)}${catTag(it.category)}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
+      <div class="kb-meta" style="margin-bottom:14px;">${isKnowledge ? plainTag('常识知识') : ''}${statusTag(it.status)}${catTag(it.category)}${it.error_code ? `<span class="tag tag-code">${esc(it.error_code)}</span>` : ''}${it.product ? plainTag(it.product) : ''}${it.module ? plainTag(it.module) : ''}</div>
       <div class="detail-block"><div class="lbl">${isKnowledge ? '知识内容' : '问题描述 / 报错现象'}</div><div class="val">${esc(it.content)}</div></div>
       ${it.solution ? `<div class="detail-block"><div class="lbl">${isKnowledge ? '补充说明' : '解决方案 / 处理步骤'}</div><div class="val">${esc(it.solution)}</div></div>` : ''}
       <div class="detail-block"><div class="lbl">适用环境 / 版本</div><div class="val">${esc(it.environment || '通用')}${it.version ? ' · ' + esc(it.version) : ''}</div></div>
@@ -610,6 +1091,8 @@ function itemForm(it, onSaved) {
     <div id="f-sol-wrap">
       <label>解决方案 / 处理步骤<span id="f-sol-req"> *</span></label><textarea id="f-solution">${esc(it.solution || '')}</textarea>
     </div>
+    <label>报错码（可选，多个用逗号分隔）</label>
+    <input type="text" id="f-code" maxlength="120" value="${esc(it.error_code || '')}" placeholder="如 ORA-12541 / 1045 / 28P01；填写后用户输入该码可直接精确命中" />
     <div class="form-row">
       <div><label>所属产品</label><input type="text" id="f-product" value="${esc(it.product || '')}" placeholder="通用类常识可留空" /></div>
       <div><label>所属模块</label><input type="text" id="f-module" value="${esc(it.module || '')}" /></div>
@@ -663,6 +1146,7 @@ function itemForm(it, onSaved) {
           environment: $('#f-env').value.trim() || null,
           version: $('#f-version').value.trim() || null,
           tags,
+          error_code: $('#f-code').value.trim() || null,
           updated_at: new Date().toISOString()
         });
         await DB.insertAuditLog({ knowledge_id: it.id, auditor: state.name, action: '修改', opinion: '编辑条目' });
@@ -684,6 +1168,7 @@ function itemForm(it, onSaved) {
           module: cls.module, category: cls.category, tags: cls.tags,
           environment: $('#f-env').value.trim() || null,
           version: $('#f-version').value.trim() || null,
+          error_code: $('#f-code').value.trim() || null,
           source: '管理员录入', status: status === '草稿' ? '草稿' : '已发布',
           auditor: state.name, audit_time: new Date().toISOString(),
           creator: state.name
@@ -810,6 +1295,7 @@ function renderAiEntries(entries, product, onDone, parseBtn) {
         </div>
         <textarea class="ai-content" style="min-height:60px;" placeholder="知识内容 / 问题描述">${esc(e.content)}</textarea>
         <textarea class="ai-solution" style="min-height:60px;${e.kind === '常识知识' ? 'display:none;' : ''}" placeholder="解决方案 / 处理步骤">${esc(e.solution)}</textarea>
+        <input type="text" class="ai-code" maxlength="120" value="${esc(e.error_code || '')}" placeholder="报错码（可选，如 ORA-12541、1045、28P01；用于精确命中）" />
         <div class="form-row">
           <div><label>分类</label><select class="ai-cat">${catOpts(e.category)}</select></div>
           <div><label>模块</label><input type="text" class="ai-module" maxlength="30" value="${esc(e.module)}" /></div>
@@ -842,8 +1328,7 @@ function renderAiEntries(entries, product, onDone, parseBtn) {
     saveBtn.textContent = '入库中…';
     try {
       // 查重：库内已有标题 + 本次已入库标题
-      const existing = await DB.listVisible({ limit: 500 });
-      const seen = new Set(existing.map((r) => r.title));
+      const seen = new Set(await DB.listTitles(3000));
       let saved = 0, skipped = 0;
       const cards = document.querySelectorAll('#ai-result .ai-entry');
       for (const card of cards) {
@@ -864,6 +1349,7 @@ function renderAiEntries(entries, product, onDone, parseBtn) {
           environment: maskSensitive(card.querySelector('.ai-env').value.trim()) || null,
           version: card.querySelector('.ai-ver').value.trim() || null,
           tags: card.querySelector('.ai-tags').value.split(/[,，、\s]+/).map((s) => s.trim()).filter(Boolean).slice(0, 6),
+          error_code: card.querySelector('.ai-code').value.trim() || null,
           source: '管理员录入', status: '已发布',
           auditor: state.name, audit_time: new Date().toISOString(),
           creator: state.name
